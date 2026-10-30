@@ -1,0 +1,149 @@
+# ====================================================================================
+#  Stacks « Visualisation de données » — fil rouge Deces entre 1970 et novembre 2026
+# ====================================================================================
+#  Base (S1–S6)         : docker compose up -d
+#  + SPARQL (S3)        : docker compose --profile semantique up -d
+#  + BI (S7, S9, S10)   : docker compose --profile bi up -d
+#  + Temps réel (S8)    : docker compose --profile temps-reel up -d
+#  Tout                 : docker compose --profile bi --profile temps-reel up -d
+#  Arrêter              : docker compose --profile "*" down
+#  Identifiants         : fichier .env (copier .env.example en .env)
+# ====================================================================================
+name: projet-dataviz
+
+services:
+
+  # --- Notebooks + Spark ----------------------------------------------------
+  jupyter:
+    image: quay.io/jupyter/pyspark-notebook:latest
+    container_name: jupyter
+    ports:
+      - "8888:8888"   # JupyterLab -> http://localhost:8888/lab?token=projet
+      - "4040:4040"   # Spark UI   -> http://localhost:4040 (session Spark active)
+    volumes:
+      - .:/home/jovyan/work            # tout le dépôt est visible dans Jupyter
+      - ivy-cache:/home/jovyan/.ivy2   # jars Spark (Delta, S3, JDBC) téléchargés une seule fois
+    command: start-notebook.py --IdentityProvider.token=${JUPYTER_TOKEN:-projet}
+    environment:
+      S3_ENDPOINT: http://rustfs:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-rustfsadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-rustfsadmin}
+      PG_URL: jdbc:postgresql://postgres:5432/${PG_DB:-deces}
+      PG_HOST: postgres
+      PG_DB: ${PG_DB:-deces}
+      PG_USER: ${PG_USER:-projet}
+      PG_PASSWORD: ${PG_PASSWORD:-projet}
+    depends_on:
+      - postgres
+      - rustfs
+
+  # --- Data lake S3 (remplaçant de MinIO) -----------------------------------
+  rustfs-init:            # donne les droits du volume à l'utilisateur RustFS, puis s'arrête
+    image: alpine:3.20
+    command: sh -c "chown -R 10001:10001 /data && echo volume pret"
+    volumes:
+      - lake-data:/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web -> http://localhost:9001
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-rustfsadmin}
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"   # un seul disque : usage local uniquement
+    volumes:
+      - lake-data:/data
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+
+  # --- Base de restitution --------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${PG_USER:-projet}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-projet}
+      POSTGRES_DB: ${PG_DB:-deces}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+  # --- Console web PostgreSQL : voir les tables, lancer du SQL --------------------
+  adminer:
+    image: adminer:latest
+    container_name: adminer
+    ports:
+      - "8080:8080"   # -> http://localhost:8080  (Système PostgreSQL, serveur postgres, projet / projet, base deces)
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      - postgres
+
+  # --- Serveur SPARQL (profil « semantique ») -----------------------------------
+  fuseki:
+    profiles: ["semantique"]
+    image: secoresearch/fuseki:latest
+    container_name: fuseki
+    ports:
+      - "3030:3030"   # -> http://localhost:3030  (admin / mot de passe du .env)
+    environment:
+      ADMIN_PASSWORD: ${FUSEKI_ADMIN_PASSWORD:-admin}
+      ENABLE_DATA_WRITE: "true"
+      ENABLE_UPDATE: "true"
+    volumes:
+      - fuseki-data:/fuseki-base/databases
+
+  # --- BI décisionnelle (profil « bi ») --------------------------------------
+  superset:
+    profiles: ["bi"]
+    image: apache/superset:5.0.0       # inclut le pilote PostgreSQL
+    container_name: superset
+    ports:
+      - "8088:8088"   # -> http://localhost:8088  (admin / admin)
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-projetdataviz}
+    volumes:
+      - superset-home:/app/superset_home
+    command: >
+      bash -c "superset db upgrade &&
+               (superset fab create-admin --username admin --firstname Admin --lastname projet --email admin@example.com --password ${SUPERSET_ADMIN_PASSWORD:-admin} || true) &&
+               superset init &&
+               /app/docker/entrypoints/run-server.sh"
+    depends_on:
+      - postgres
+
+  # --- Temps réel (profil « temps-reel ») ------------------------------------
+  grafana:
+    profiles: ["temps-reel"]
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"   # -> http://localhost:3000  (admin / admin)
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      PG_USER: ${PG_USER:-projet}
+      PG_PASSWORD: ${PG_PASSWORD:-projet}
+      PG_DB: ${PG_DB:-deces}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning   # source PostgreSQL + dashboard prêts
+    depends_on:
+      - postgres
+
+volumes:
+  ivy-cache:
+  lake-data:
+  pg-data:
+  superset-home:
+  grafana-data:
+  fuseki-data:
